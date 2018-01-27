@@ -5,16 +5,92 @@ from __future__ import (
 
 import csv
 import re
+import requests
+import time
 
 from collections import (
     defaultdict,
     namedtuple,
 )
+from contextlib import contextmanager
+from datetime import timedelta
 from dateutil.parser import parse as dateparse
 from dateutil.tz import tzutc
 from pprint import pprint
 
-CommonRow = namedtuple('CommonRow', ['pair', 'src', 'dst', 'site', 'ts_orig', 'ts'])
+GDAX_API = 'https://api.gdax.com'
+
+CommonRow = namedtuple('CommonRow', ['pair', 'src', 'dst', 'site', 'ts_orig', 'ts_parsed'])
+CommonRowWUSD = namedtuple('CommonRow', ['pair', 'src', 'dst', 'site', 'ts_parsed', 'src_usd', 'dst_usd'])
+
+@contextmanager
+def gdax_price_cache_deco():
+    gdax_price_cache = {}
+    with open('gdax_price_cache/gdax_price_cache.csv') as f:
+        for row in csv.DictReader(f):
+            ts = dateparse(row['ts']).isoformat()
+            gdax_price_cache[(row['type'], ts)] = row['price']
+
+    yield gdax_price_cache
+
+    with open('gdax_price_cache/gdax_price_cache.csv', 'w') as f:
+        w = csv.writer(f)
+        w.writerow(['type', 'ts', 'price'])
+        for (typ, isots), result in gdax_price_cache.items():
+            w.writerow([typ, isots, result])
+
+def fetch_usd_equivalents(common_rows):
+    # type: List[CommonRow] -> List[CommonRowWUSD]
+    with gdax_price_cache_deco() as gdax_price_cache:
+        common_rows_w_usd = []
+        for row in common_rows:
+            if 'USD' in row.pair:
+                # Don't need to fetch this one since it was a USD trade
+                common_rows_w_usd.append(CommonRowWUSD(
+                    row.pair, row.src, row.dst, row.site, row.ts_parsed, None, None,
+                ))
+                continue
+
+            # Fill gdax_price_cache
+            isots = row.ts_parsed.isoformat()
+            isots_end = (row.ts_parsed + timedelta(seconds=65)).isoformat()
+            for typ in ('BTC', 'ETH'):
+                if typ in row.pair and (typ, isots) not in gdax_price_cache:
+                    req = "{}/products/{}-USD/candles".format(GDAX_API, typ)
+                    result = requests.get(req, {'granularity': 60, 'start': isots, 'end': isots_end}).json()
+                    print("Req = {}.\nResult = {}".format(req, result))
+                    if not result:
+                        print("No data from gdax")
+                    else:
+                        print("Price of BTC at {} was {}".format(row.ts_parsed, result[0][1]))
+                        assert len(result) <= 2
+                        gdax_price_cache[(typ, isots)] = result[0][1]
+
+                    print("Sleeping 0.2 to backoff from gdax api")
+                    time.sleep(0.4)
+
+def dedupe(common_rows):
+    # type: List[CommonRow] -> List[CommonRow]
+    """Dedupe things that happened on the same day"""
+    by_day = defaultdict(list)
+    for row in common_rows:
+        by_day[(row.pair, row.site, row.ts_parsed.date())].append(row)
+
+    deduped_rows = []
+    for (pair, site, ts_date), rows in by_day.items():
+        assert len(rows) > 0
+        if len(rows) == 1:
+            deduped_rows.append(rows[0])
+        else:
+            deduped_rows.append(CommonRow(
+                pair,
+                sum(r.src for r in rows),
+                sum(r.dst for r in rows),
+                site + "[ {} rows combined ]".format(len(rows)),
+                "[lost]",
+                ts_date,
+            ))
+    return deduped_rows
 
 def convert_cex_row(row):
     # type: (Dict[str, str]) -> CommonRow
@@ -89,7 +165,7 @@ def convert_kraken_row(row):
     assert (prev_amt < 0 and amt > 0 or prev_amt > 0 and amt < 0)
     assert prev_row['time'] == row['time']
 
-    return CommonRow(pair, prev_amt, amt, 'Kraken', row['time'], dateparse(row['time']))
+    return CommonRow(pair, prev_amt, amt, 'Kraken', row['time'], dateparse(row['time']).replace(tzinfo=tzutc()))
 
 def convert_poloniex_row(row):
     # type: (Dict[str, str]) -> CommonRow
@@ -104,7 +180,7 @@ def convert_poloniex_row(row):
         dst = -dst
     if row['Type'] == 'Sell':
         src = -dst
-    return CommonRow(row['Market'], src, dst, 'Poloniex', row['Date'], dateparse(row['Date']))
+    return CommonRow(row['Market'], src, dst, 'Poloniex', row['Date'], dateparse(row['Date']).replace(tzinfo=tzutc()))
 
 def convert_gdax_rows(rows):
     # type: (List[Dict[str, str]]) -> List[CommonRow]
@@ -179,6 +255,7 @@ if __name__ == "__main__":
     with open('csvs/123117-Poloniex-TradeHistory.csv') as f:
         poloniex_rows = list(csv.DictReader(f))
 
+    print("Orig row Counts")
     pprint([len(cex_rows), len(cb_btc_rows), len(cb_eth_rows),
             len(gdax_btc_rows), len(gdax_eth_rows), len(gdax_usd_rows),
             len(kraken_rows), len(poloniex_rows)])
@@ -190,10 +267,12 @@ if __name__ == "__main__":
     common_poloniex_rows = convert_rows(poloniex_rows, convert_poloniex_row)
     common_gdax_rows = convert_gdax_rows(gdax_btc_rows + gdax_eth_rows + gdax_usd_rows)
 
+    print("Common row counts")
     pprint([len(common_cex_rows), len(common_cb_btc_rows), len(common_cb_eth_rows),
             len(common_gdax_rows),
             len(common_kraken_rows), len(common_poloniex_rows)])
 
+    print("Example common rows:")
     pprint([common_cex_rows[0], common_cb_btc_rows[0], common_cb_eth_rows[0],
             common_gdax_rows[0],
             common_kraken_rows[0], common_poloniex_rows[0]])
@@ -201,7 +280,20 @@ if __name__ == "__main__":
     common_rows = sorted(
         common_cex_rows + common_cb_btc_rows + common_cb_eth_rows +
         common_kraken_rows + common_poloniex_rows + common_gdax_rows,
-        key=lambda row: row.ts,
+        key=lambda row: row.ts_parsed,
     )
 
+    print("Total common rows:")
     pprint(len(common_rows))
+
+    with open('intermediate/123117-rows_interleaved.csv', 'w') as f:
+        w = csv.writer(f)
+        w.writerow(CommonRow._fields)
+        w.writerows(common_rows)
+
+    common_rows_w_usd = fetch_usd_equivalents(common_rows)
+
+    deduped_rows = dedupe(common_rows)
+
+    print("Total deduped rows:")
+    pprint(len(deduped_rows))

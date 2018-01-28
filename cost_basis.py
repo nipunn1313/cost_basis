@@ -76,11 +76,12 @@ def select_buy(sell, buys):
     # return 0  # FIFO: ST 600K, LT 597K
     # return len(buys) - 1  # LIFO: ST 463K, LT 732K
 
-    # If it's ST no matter what, take the shortest
     # This gets ST: 449K, LT: 747K
+    # If it's ST no matter what, take the shortest
     if sell.ts_parsed - buys[0].ts_parsed < timedelta(days=366):
         return len(buys) - 1
     # Otherwise take the first LT
+    # return 0
     for idx, buy in reversed(list(enumerate(buys))):
         if sell.ts_parsed - buy.ts_parsed >= timedelta(days=366):
             return idx
@@ -475,8 +476,19 @@ if __name__ == "__main__":
 
     # FINALLY. Get cost basis
     cb_by_typ = {typ: cost_basis(buys_sells) for typ, buys_sells in deduped_bs_by_typ.items()}
-
     pprint(cb_by_typ)
+
+    with open('intermediate/04-123117-cost_basis.csv', 'w') as f:
+        w = csv.writer(f)
+        w.writerow(CostBasis._fields)
+        for typ, bses in cb_by_typ.items():
+            w.writerows(bses[0])
+
+    with open('intermediate/05-123117-remaining_assets.csv', 'w') as f:
+        w = csv.writer(f)
+        w.writerow(Buy._fields)
+        for typ, bses in cb_by_typ.items():
+            w.writerows(bses[1])
 
     short_term_16 = sum(r.cost - r.basis for cbs in cb_by_typ.values() for r in cbs[0]
                         if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == 2016)

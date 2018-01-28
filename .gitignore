@@ -1,2 +1,4 @@
 .*.swp
 csvs/
+intermediate/
+gdax_price_cache/

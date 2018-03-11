@@ -4,8 +4,10 @@ from __future__ import (
 )
 
 import csv
+import os
 import re
 import requests
+import shutil
 import time
 
 from collections import (
@@ -15,7 +17,8 @@ from collections import (
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from dateutil.parser import parse as dateparse
-from dateutil.tz import tzutc
+from dateutil.tz import tzutc, tzoffset
+from io import StringIO
 from pprint import pprint
 
 GDAX_API = 'https://api.gdax.com'
@@ -24,13 +27,16 @@ CommonRow = namedtuple('CommonRow', ['pair', 'src', 'dst', 'site', 'ts_orig', 't
 CommonRowWUSD = namedtuple('CommonRowWUSD', ['pair', 'src', 'dst', 'site', 'ts_parsed', 'src_usd', 'dst_usd'])
 Buy = namedtuple('Buy', ['typ', 'amt', 'cost', 'site', 'ts_parsed'])
 Sell = namedtuple('Sell', ['typ', 'amt', 'cost', 'site', 'ts_parsed'])
-CostBasis = namedtuple('CostBasis', ['typ', 'amt', 'cost', 'basis', 'buy_ts', 'sell_ts'])
+CostBasis = namedtuple('CostBasis', ['typ', 'amt', 'proceeds', 'basis', 'buy_ts', 'sell_ts', 'buy_site', 'sell_site'])
 
 def cost_basis(buys_sells):
     # type: (List[Union[Buy, Sell]]) -> Tuple[List[CostBasis], List[Buy]]
     """Returns cost basis of realized gains + leftover buys"""
     cbs = []
     buys = []
+
+    buys_sells = sorted(buys_sells, key=lambda row: (row.ts_parsed, type(row).__name__))
+
     for bs in buys_sells:
         if isinstance(bs, Buy):
             buys.append(bs)
@@ -47,7 +53,8 @@ def cost_basis(buys_sells):
                 # Split the buy
                 basis = buy.cost * (sell.amt / buy.amt)
                 buys[buy_idx] = buy._replace(amt=buy.amt - sell.amt, cost=buy.cost - basis)
-                cbs.append(CostBasis(sell.typ, sell.amt, sell.cost, basis, buy.ts_parsed, sell.ts_parsed))
+                cbs.append(CostBasis(sell.typ, sell.amt, sell.cost, basis,
+                                     buy.ts_parsed, sell.ts_parsed, buy.site, sell.site))
 
                 if buys[buy_idx].cost <= 1e-6:
                     del buys[buy_idx]
@@ -56,7 +63,8 @@ def cost_basis(buys_sells):
                 # Split the sell
                 assert buy.amt <= sell.amt
                 partial_sell_cost = sell.cost * (buy.amt / sell.amt)
-                cbs.append(CostBasis(sell.typ, buy.amt, partial_sell_cost, buy.cost, buy.ts_parsed, sell.ts_parsed))
+                cbs.append(CostBasis(sell.typ, buy.amt, partial_sell_cost, buy.cost,
+                                     buy.ts_parsed, sell.ts_parsed, buy.site, sell.site))
 
                 del buys[buy_idx]
                 sell = sell._replace(amt=sell.amt - buy.amt, cost=sell.cost - partial_sell_cost)
@@ -73,19 +81,34 @@ def select_buy(sell, buys):
     This is where FIFO or LIFO or something more complex happens
 
     Return the idx into the buys"""
-    # return 0  # FIFO: ST 600K, LT 597K
-    # return len(buys) - 1  # LIFO: ST 463K, LT 732K
+    assert buys == sorted(buys, key=lambda r: r.ts_parsed)
 
-    # This gets ST: 449K, LT: 747K
-    # If it's ST no matter what, take the shortest
-    if sell.ts_parsed - buys[0].ts_parsed < timedelta(days=366):
-        return len(buys) - 1
-    # Otherwise take the first LT
-    # return 0
-    for idx, buy in reversed(list(enumerate(buys))):
-        if sell.ts_parsed - buy.ts_parsed >= timedelta(days=366):
+    def smart_lifo():
+        # If it's ST no matter what, take the shortest
+        if sell.ts_parsed - buys[0].ts_parsed < timedelta(days=366):
+            return len(buys) - 1
+        # Otherwise take the shortest LT
+        for idx, buy in reversed(list(enumerate(buys))):
+            if sell.ts_parsed - buy.ts_parsed >= timedelta(days=366):
+                return idx
+
+        raise Exception("Something went wrong")
+
+    def lowest_gains():
+        # This optimizes for paying least taxes now. Most open positions left for later.
+        # If it's ST no matter what, take the smallest gain
+        if sell.ts_parsed - buys[0].ts_parsed < timedelta(days=366):
+            _, idx = max((b.cost / b.amt, idx) for idx, b in enumerate(buys))
             return idx
-    raise Exception("Something went wrong")
+        # Otherwise take smallest gain that is LT
+        _, idx = max((b.cost / b.amt, idx) for idx, b in enumerate(buys)
+                     if sell.ts_parsed - b.ts_parsed >= timedelta(days=366))
+        return idx
+
+    # return 0  # FIFO: ST (23.7K + 576K), LT 597K
+    # return len(buys) - 1  # LIFO: ST (23.6K + 575K), LT 597K
+    return smart_lifo()  # ST: (23.7K + 424K), LT: 749K
+    # return lowest_gains()  # ST: (23.5K + 424K), LT: 748.6K
 
 def get_buys_sells_by_typ(common_rows_w_usd):
     # type: (List[CommonRowWUSD]) -> Dict[str, List[Union[Buy, Sell]]]
@@ -212,7 +235,7 @@ def fetch_usd_equivalents(common_rows):
 
         return common_rows_w_usd
 
-def dedupe(buys_sells):
+def dedupe_bs(buys_sells):
     # type: List[Union[Buys, Sells]] -> List[Union[Buys, Sells]]
     """Dedupe things that happened on the same day"""
     by_day = defaultdict(list)
@@ -248,6 +271,35 @@ def dedupe(buys_sells):
     deduped_rows = sorted(deduped_rows, key=lambda row: (row.ts_parsed, type(row).__name__))
     return deduped_rows
 
+def dedupe_cb(cost_basis):
+    # type: List[CostBasis] -> List[CostBasis]
+    """Dedupe things that happened on the same day"""
+    by_day = defaultdict(list)
+    for row in cost_basis:
+        by_day[(row.typ, row.buy_ts.date(), row.sell_ts.date())].append(row)
+
+    deduped_rows = []
+    for (typ, buy_ts, sell_ts), rows in by_day.items():
+        assert len(rows) > 0
+        if len(rows) == 1:
+            row = rows[0]._replace(buy_ts=buy_ts, sell_ts=sell_ts)
+            deduped_rows.append(row)
+        else:
+            deduped_rows.append(CostBasis(
+                typ,
+                sum(r.amt for r in rows),
+                sum(r.proceeds for r in rows),
+                sum(r.basis for r in rows),
+                buy_ts,
+                sell_ts,
+                "[ {} rows combined ]".format(len(rows)),
+                "[ {} rows combined ]".format(len(rows)),
+            ))
+
+    # Sort by typ/date. Buys before sells
+    deduped_rows = sorted(deduped_rows, key=lambda row: (row.sell_ts, row.buy_ts))
+    return deduped_rows
+
 def convert_cex_row(row):
     # type: (Dict[str, str]) -> CommonRow
     if row['Type'] in ('deposit', 'withdraw'):
@@ -277,6 +329,20 @@ def convert_cex_row(row):
     else:
         raise Exception("Unknown CEX row: %s" % row)
 
+def test_convert_cex_row():
+    t = """DateUTC,Amount,Symbol,Balance,Type,Pair,FeeSymbol,FeeAmount,Comment
+2017-12-20 09:55:03,795.59,USD,895.75,sell,ETH/USD,USD,1.98,Sold 0.88816258 ETH at 898 USD
+2017-12-31 19:23:29,1.11126500,ETH,1.11126500,buy,ETH/USD,USD,2.29,Bought 1.11126500 ETH at 821.9999 USD"""
+    f = StringIO(t)
+    cex_rows = list(csv.DictReader(f))
+    common_rows = convert_rows(cex_rows, convert_cex_row)
+    assert common_rows == [
+        CommonRow("ETH/USD", -0.88816258, 795.59, "CEX", "2017-12-20 09:55:03",
+                  datetime(2017, 12, 20, 9, 55, 3, tzinfo=tzutc())),
+        CommonRow("ETH/USD", 1.11126500, -(1.11126500 * 821.9999), "CEX", "2017-12-31 19:23:29",
+                  datetime(2017, 12, 31, 19, 23, 29, tzinfo=tzutc())),
+    ]
+
 def convert_coinbase_row(row):
     # type: (Dict[str, str]) -> CommonRow
     crypto_type = row['Currency']
@@ -292,6 +358,21 @@ def convert_coinbase_row(row):
     if crypto > 0:
         fiat = -fiat
     return CommonRow(pair, crypto, fiat, 'Coinbase', row['Timestamp'], dateparse(row['Timestamp']))
+
+def test_convert_coinbase_row():
+    t = """Timestamp,Balance,Amount,Currency,To,Notes,Instantly Exchanged,Transfer Total,Transfer Total Currency,Transfer Fee,Transfer Fee Currency,Transfer Payment Method,Transfer ID,Order Price,Order Currency,Order BTC,Order Tracking Code,Order Custom Parameter,Order Paid Out,Recurring Payment ID,Coinbase ID (visit https://www.coinbase.com/transactions/[ID] in your browser),Bitcoin Hash (visit https://www.coinbase.com/tx/[HASH] in your browser for more info)
+2016-04-03 12:44:17 -0700,0.04714286,0.04714286,BTC,570170d6ede0d822170003cb,Bought 0.04714286 BTC for $20.00 USD.,false,20.0,USD,0.2,USD,Bank of America - BofA... ********9496,5701728b2ee3cd04b500048b,"","","","","","","",57017291e42ae13d2a00020b,""
+2017-07-11 17:04:58 -0700,8.28632484,-1.0,ETH,572a417ae1764802e1000599,596567a9ea216a0222536a1d,false,187.53,USD,2.99,USD,USD Wallet,596567a9ea216a0222536a1d,"","","","","","","",596567aa2122dd0001f25f0d,""
+"""
+    f = StringIO(t)
+    coinbase_rows = list(csv.DictReader(f))
+    common_rows = convert_rows(coinbase_rows, convert_coinbase_row)
+    assert common_rows == [
+        CommonRow("BTC/USD", 0.04714286, -20.0, "Coinbase", "2016-04-03 12:44:17 -0700",
+                  datetime(2016, 4, 3, 12, 44, 17, tzinfo=tzoffset(None, -25200))),
+        CommonRow("ETH/USD", -1.0, 187.53, "Coinbase", "2017-07-11 17:04:58 -0700",
+                  datetime(2017, 7, 11, 17, 4, 58, tzinfo=tzoffset(None, -25200))),
+    ]
 
 kraken_cache = {}  # type: Dict[str, Tuple[str, str]]
 def convert_kraken_row(row):
@@ -323,6 +404,23 @@ def convert_kraken_row(row):
 
     return CommonRow(pair, prev_amt, amt, 'Kraken', row['time'], dateparse(row['time']).replace(tzinfo=tzutc()))
 
+def test_convert_kraken_row():
+    t = """"txid","refid","time","type","aclass","asset","amount","fee","balance"
+"LQT3EO-D4PO7-6QCRZP","TZBXCO-6DHLN-ZO22HQ","2016-04-23 21:23:03","trade","currency","XETH",-2.0000000000,0.0000000000,8.0000000000
+"LRY4II-TYZCS-QLC4FT","TZBXCO-6DHLN-ZO22HQ","2016-04-23 21:23:03","trade","currency","ZUSD",16.9710,0.0441,16.9269
+"LUJMM6-BTILY-SH6QFA","TXDUA7-QGSEW-5AHH7Q","2016-06-17 11:32:53","trade","currency","XETH",-8.0410719900,0.0000000000,1591.9589378300
+"LX6PV7-CN5YE-Z4HNT7","TXDUA7-QGSEW-5AHH7Q","2016-06-17 11:32:53","trade","currency","XXBT",0.1861590000,0.0004840000,0.1856750000
+"""
+    f = StringIO(t)
+    kraken_rows = list(csv.DictReader(f))
+    common_rows = convert_rows(kraken_rows, convert_kraken_row)
+    assert common_rows == [
+        CommonRow("ETH/USD", -2.0, 16.9710, "Kraken", "2016-04-23 21:23:03",
+                  datetime(2016, 4, 23, 21, 23, 3, tzinfo=tzutc())),
+        CommonRow("ETH/BTC", -8.0410719900, 0.1861590000, "Kraken", "2016-06-17 11:32:53",
+                  datetime(2016, 6, 17, 11, 32, 53, tzinfo=tzutc())),
+    ]
+
 def convert_poloniex_row(row):
     # type: (Dict[str, str]) -> CommonRow
     assert row['Category'] == 'Exchange'
@@ -338,10 +436,24 @@ def convert_poloniex_row(row):
         src = -src
     return CommonRow(row['Market'], src, dst, 'Poloniex', row['Date'], dateparse(row['Date']).replace(tzinfo=tzutc()))
 
+def test_convert_poloniex_row():
+    t = """Date,Market,Category,Type,Price,Amount,Total,Fee,Order Number,Base Total Less Fee,Quote Total Less Fee
+2016-06-29 03:54:56,XEM/BTC,Exchange,Buy,0.00001934,27774.58651931,0.53716050,0.15%,2311153645,-0.53716050,27732.92463954
+2017-12-16 23:41:09,XEM/BTC,Exchange,Sell,0.00003310,6429.67600000,0.21282227,0.25%,38237473363,0.21229022,-6429.67600000
+"""
+    f = StringIO(t)
+    poloniex_rows = list(csv.DictReader(f))
+    common_rows = convert_rows(poloniex_rows, convert_poloniex_row)
+    assert common_rows == [
+        CommonRow("XEM/BTC", 27774.58651931, -0.53716050, "Poloniex", "2016-06-29 03:54:56",
+                  datetime(2016, 6, 29, 3, 54, 56, tzinfo=tzutc())),
+        CommonRow("XEM/BTC", -6429.67600000, 0.21282227, "Poloniex", "2017-12-16 23:41:09",
+                  datetime(2017, 12, 16, 23, 41, 9, tzinfo=tzutc())),
+    ]
 def convert_gdax_rows(rows):
     # type: (List[Dict[str, str]]) -> List[CommonRow]
     gdax_trades = defaultdict(list)
-    for row in gdax_btc_rows + gdax_eth_rows + gdax_usd_rows:
+    for row in rows:
         if row['trade id']:
             gdax_trades[row['trade id']].append(row)
 
@@ -382,7 +494,7 @@ def convert_rows(rows, convert_func):
     assert not kraken_cache
     return common_rows
 
-if __name__ == "__main__":
+def run_2016_2017():
     with open('csvs/123117-CEX.csv') as f:
         cex_rows = list(csv.DictReader(f))
 
@@ -449,6 +561,10 @@ if __name__ == "__main__":
     print("Total common rows:")
     pprint(len(common_rows))
 
+    if os.path.exists('intermediate'):
+        shutil.rmtree('intermediate')
+    os.mkdir('intermediate')
+
     with open('intermediate/01-123117-rows_interleaved.csv', 'w') as f:
         w = csv.writer(f)
         w.writerow(CommonRow._fields)
@@ -463,48 +579,87 @@ if __name__ == "__main__":
 
     bs_by_typ = get_buys_sells_by_typ(common_rows_w_usd)
 
-    deduped_bs_by_typ = {typ: dedupe(buys_sells) for typ, buys_sells in bs_by_typ.items()}
-
+    # Dedupe buys_sells to write to file for observation
+    deduped_bs_by_typ = {typ: dedupe_bs(buys_sells) for typ, buys_sells in bs_by_typ.items()}
     with open('intermediate/03-123117-rows_deduped_by_day.csv', 'w') as f:
         w = csv.writer(f)
         w.writerow(['BuyOrSell'] + list(Buy._fields))
         for typ, bses in deduped_bs_by_typ.items():
             w.writerows([[type(bs).__name__] + list(bs) for bs in bses])
 
-    print("Total deduped rows:")
-    pprint({typ: len(bs) for typ, bs in deduped_bs_by_typ.items()})
-
-    # FINALLY. Get cost basis
-    cb_by_typ = {typ: cost_basis(buys_sells) for typ, buys_sells in deduped_bs_by_typ.items()}
-    pprint(cb_by_typ)
+    # FINALLY. Get cost basis and remaining assets.
+    cb_by_typ = {typ: cost_basis(buys_sells) for typ, buys_sells in bs_by_typ.items()}
 
     with open('intermediate/04-123117-cost_basis.csv', 'w') as f:
         w = csv.writer(f)
         w.writerow(CostBasis._fields)
-        for typ, bses in cb_by_typ.items():
-            w.writerows(bses[0])
+        for typ, (cbs, assets) in cb_by_typ.items():
+            w.writerows(cbs)
 
     with open('intermediate/05-123117-remaining_assets.csv', 'w') as f:
         w = csv.writer(f)
         w.writerow(Buy._fields)
-        for typ, bses in cb_by_typ.items():
-            w.writerows(bses[1])
+        for typ, (cbs, assets) in cb_by_typ.items():
+            w.writerows(assets)
 
-    short_term_16 = sum(r.cost - r.basis for cbs in cb_by_typ.values() for r in cbs[0]
-                        if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == 2016)
-    short_term_17 = sum(r.cost - r.basis for cbs in cb_by_typ.values() for r in cbs[0]
-                        if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == 2017)
-    short_term_18 = sum(r.cost - r.basis for cbs in cb_by_typ.values() for r in cbs[0]
-                        if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == 2018)
-    long_term_16 = sum(r.cost - r.basis for cbs in cb_by_typ.values() for r in cbs[0]
-                       if r.sell_ts - r.buy_ts >= timedelta(days=366) and r.sell_ts.year == 2016)
-    long_term_17 = sum(r.cost - r.basis for cbs in cb_by_typ.values() for r in cbs[0]
-                       if r.sell_ts - r.buy_ts >= timedelta(days=366) and r.sell_ts.year == 2017)
-    long_term_18 = sum(r.cost - r.basis for cbs in cb_by_typ.values() for r in cbs[0]
-                       if r.sell_ts - r.buy_ts >= timedelta(days=366) and r.sell_ts.year == 2018)
-    pprint(short_term_16)
-    pprint(short_term_17)
-    pprint(short_term_18)
-    pprint(long_term_16)
-    pprint(long_term_17)
-    pprint(long_term_18)
+    # Dedupe cost basis by day to make filing easier
+    deduped_cb_by_typ = {typ: dedupe_cb(cost_basis) for typ, (cost_basis, leftover) in cb_by_typ.items()}
+    pprint(deduped_cb_by_typ)
+
+    with open('intermediate/06-123117-cb_deduped_by_day.csv', 'w') as f:
+        w = csv.writer(f)
+        w.writerow(list(CostBasis._fields))
+        for typ, cbs in deduped_cb_by_typ.items():
+            w.writerows(cbs)
+
+    for yr in (2016, 2017):
+        with open('intermediate/07-%d-cb_for_easytxf.csv' % yr, 'w') as f:
+            w = csv.writer(f)
+            w.writerow(["Symbol", "Quantity", "Date Acquired", "Date Sold", "Proceeds",
+                        "Cost Basis", "Gain (or loss)", "Sale Category"])
+            for typ, cbs in deduped_cb_by_typ.items():
+                w.writerows([
+                    [
+                        cb.typ, cb.amt, cb.buy_ts.isoformat(), cb.sell_ts.isoformat(),
+                        cb.proceeds, cb.basis, cb.proceeds - cb.basis,
+                        "Box C [Short term unreported]" if cb.sell_ts - cb.buy_ts < timedelta(days=366)
+                        else "Box F [Long term unreported]",
+                    ]
+                    for cb in cbs
+                    if cb.sell_ts.year == yr
+                ])
+
+    print("Total deduped rows:")
+    pprint({typ: len(bs) for typ, bs in deduped_cb_by_typ.items()})
+
+    totals = {
+        2016: {},
+        2017: {},
+    }
+    for yr in (2016, 2017):
+        totals[yr]['st_proceeds'] = sum(
+            r.proceeds for cbs in cb_by_typ.values() for r in cbs[0]
+            if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == yr
+        )
+        totals[yr]['st_basis'] = sum(
+            r.basis for cbs in cb_by_typ.values() for r in cbs[0]
+            if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == yr
+        )
+        totals[yr]['lt_proceeds'] = sum(
+            r.proceeds for cbs in cb_by_typ.values() for r in cbs[0]
+            if r.sell_ts - r.buy_ts >= timedelta(days=366) and r.sell_ts.year == yr
+        )
+        totals[yr]['lt_basis'] = sum(
+            r.basis for cbs in cb_by_typ.values() for r in cbs[0]
+            if r.sell_ts - r.buy_ts >= timedelta(days=366) and r.sell_ts.year == yr
+        )
+
+        totals[yr]['st_gain'] = totals[yr]['st_proceeds'] - totals[yr]['st_basis']
+        totals[yr]['lt_gain'] = totals[yr]['lt_proceeds'] - totals[yr]['lt_basis']
+
+    pprint(totals)
+
+    import IPython; IPython.embed()
+
+if __name__ == "__main__":
+    run_2016_2017()

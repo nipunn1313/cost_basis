@@ -25,8 +25,10 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     NamedTuple,
     Optional,
+    Sequence,
     Tuple,
     Type,
     Union,
@@ -355,7 +357,7 @@ def dedupe_cb(cost_basis):
     return deduped_rows
 
 def convert_cex_row(row):
-    # type: (Dict[str, str]) -> Optional[CommonRow]
+    # type: (Mapping[str, str]) -> Optional[CommonRow]
     if row['Type'] in ('deposit', 'withdraw'):
         # Just a transfer.
         return None
@@ -398,7 +400,7 @@ def test_convert_cex_row():
     ]
 
 def convert_coinbase_row(row):
-    # type: (Dict[str, str]) -> Optional[CommonRow]
+    # type: (Mapping[str, str]) -> Optional[CommonRow]
     crypto_type = row['Currency']
     fiat_type = row['Transfer Total Currency']
     if not (crypto_type and fiat_type):
@@ -428,9 +430,9 @@ def test_convert_coinbase_row():
                   datetime(2017, 7, 11, 17, 4, 58, tzinfo=tzoffset(None, -25200))),
     ]
 
-kraken_cache = {}  # type: Dict[str, Dict[str, str]]
+kraken_cache = {}  # type: Dict[str, Mapping[str, str]]
 def convert_kraken_row(row):
-    # type: (Dict[str, str]) -> Optional[CommonRow]
+    # type: (Mapping[str, str]) -> Optional[CommonRow]
     if row['type'] in ('deposit', 'withdrawal', 'transfer'):
         return None
     if row['type'] != 'trade':
@@ -476,7 +478,7 @@ def test_convert_kraken_row():
     ]
 
 def convert_poloniex_row(row):
-    # type: (Dict[str, str]) -> CommonRow
+    # type: (Mapping[str, str]) -> CommonRow
     assert row['Category'] == 'Exchange'
     if row['Type'] not in ('Buy', 'Sell'):
         raise Exception("Unknown poloniex row: %s" % row)
@@ -505,7 +507,7 @@ def test_convert_poloniex_row():
                   datetime(2017, 12, 16, 23, 41, 9, tzinfo=tzutc())),
     ]
 def convert_gdax_rows(rows):
-    # type: (List[Dict[str, str]]) -> List[CommonRow]
+    # type: (Sequence[Dict[str, str]]) -> List[CommonRow]
     gdax_trades = defaultdict(list)  # type: Dict[str, List[Dict[str, str]]]
     for row in rows:
         if row['trade id']:
@@ -539,7 +541,7 @@ def convert_gdax_rows(rows):
     return common_rows
 
 def convert_rows(rows, convert_func):
-    # type: (List[Dict[str, str]], Callable[[Dict[str, str]], CommonRow]) -> List[CommonRow]
+    # type: (Sequence[Mapping[str, str]], Callable[[Mapping[str, str]], Optional[CommonRow]]) -> List[CommonRow]
     common_rows = []
     for row in rows:
         conv = convert_func(row)
@@ -549,6 +551,7 @@ def convert_rows(rows, convert_func):
     return common_rows
 
 def import_2016_2017():
+    # type: () -> List[CommonRow]
     with open('csvs/123117-CEX.csv') as f:
         cex_rows = list(csv.DictReader(f))
 
@@ -613,8 +616,8 @@ def import_2016_2017():
     )
     return common_rows
 
-def run_2016_2017():
-    common_rows = import_2016_2017()
+def make_intermediate(common_rows):
+    # type: (List[CommonRow]) -> Dict[str, List[CostBasis]]
 
     print("Total common rows:")
     pprint(len(common_rows))
@@ -643,7 +646,7 @@ def run_2016_2017():
         w = csv.writer(f)
         w.writerow(['BuyOrSell'] + list(Buy._fields))
         for typ, bses in deduped_bs_by_typ.items():
-            w.writerows([[type(bs).__name__] + list(bs) for bs in bses])
+            w.writerows([[type(bs).__name__] + [str(field) for field in bs] for bs in bses])
 
     # FINALLY. Get cost basis and remaining assets.
     cb_by_typ = {typ: cost_basis(buys_sells) for typ, buys_sells in bs_by_typ.items()}
@@ -670,7 +673,7 @@ def run_2016_2017():
         for typ, cbs in deduped_cb_by_typ.items():
             w.writerows(cbs)
 
-    for yr in (2016, 2017):
+    for yr in (2016, 2017, 2018):
         with open('intermediate/07-%d-cb_for_easytxf.csv' % yr, 'w') as f:
             w = csv.writer(f)
             w.writerow(["Symbol", "Quantity", "Date Acquired", "Date Sold", "Proceeds",
@@ -690,32 +693,40 @@ def run_2016_2017():
     print("Total deduped rows:")
     pprint({typ: len(bs) for typ, bs in deduped_cb_by_typ.items()})
 
+    return deduped_cb_by_typ
+
+def printout(deduped_cb_by_typ):
+    # type: (Dict[str, List[CostBasis]]) -> None
     totals = {
         2016: {},
         2017: {},
-    }
+    }  # type: Dict[int, Dict[str, float]]
     for yr in (2016, 2017):
         totals[yr]['st_proceeds'] = sum(
-            r.proceeds for cbs in cb_by_typ.values() for r in cbs[0]
+            r.proceeds for cbs in deduped_cb_by_typ.values() for r in cbs
             if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == yr
         )
         totals[yr]['st_basis'] = sum(
-            r.basis for cbs in cb_by_typ.values() for r in cbs[0]
+            r.basis for cbs in deduped_cb_by_typ.values() for r in cbs
             if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == yr
         )
         totals[yr]['lt_proceeds'] = sum(
-            r.proceeds for cbs in cb_by_typ.values() for r in cbs[0]
+            r.proceeds for cbs in deduped_cb_by_typ.values() for r in cbs
             if r.sell_ts - r.buy_ts >= timedelta(days=366) and r.sell_ts.year == yr
         )
         totals[yr]['lt_basis'] = sum(
-            r.basis for cbs in cb_by_typ.values() for r in cbs[0]
+            r.basis for cbs in deduped_cb_by_typ.values() for r in cbs
             if r.sell_ts - r.buy_ts >= timedelta(days=366) and r.sell_ts.year == yr
         )
 
         totals[yr]['st_gain'] = totals[yr]['st_proceeds'] - totals[yr]['st_basis']
         totals[yr]['lt_gain'] = totals[yr]['lt_proceeds'] - totals[yr]['lt_basis']
-
     pprint(totals)
+
+def run_2016_2017():
+    common_rows = import_2016_2017()
+    deduped_cb_by_typ = make_intermediate(common_rows)
+    printout(deduped_cb_by_typ)
 
     # import IPython; IPython.embed()
 

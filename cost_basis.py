@@ -15,19 +15,69 @@ from collections import (
     namedtuple,
 )
 from contextlib import contextmanager
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta, time as dt_time
 from dateutil.parser import parse as dateparse
 from dateutil.tz import tzutc, tzoffset
 from io import StringIO
 from pprint import pprint
 
+from typing import (
+    Callable,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
+
 GDAX_API = 'https://api.gdax.com'
 
-CommonRow = namedtuple('CommonRow', ['pair', 'src', 'dst', 'site', 'ts_orig', 'ts_parsed'])
-CommonRowWUSD = namedtuple('CommonRowWUSD', ['pair', 'src', 'dst', 'site', 'ts_parsed', 'src_usd', 'dst_usd'])
-Buy = namedtuple('Buy', ['typ', 'amt', 'cost', 'site', 'ts_parsed'])
-Sell = namedtuple('Sell', ['typ', 'amt', 'cost', 'site', 'ts_parsed'])
-CostBasis = namedtuple('CostBasis', ['typ', 'amt', 'proceeds', 'basis', 'buy_ts', 'sell_ts', 'buy_site', 'sell_site'])
+class CommonRow(NamedTuple):
+    pair: str
+    src: float
+    dst: float
+    site: str
+    ts_orig: str
+    ts_parsed: datetime
+
+class CommonRowWUSD(NamedTuple):
+    pair: str
+    src: float
+    dst: float
+    site: str
+    ts_parsed: datetime
+    src_usd: Optional[float]
+    dst_usd: Optional[float]
+
+class Buy(NamedTuple):
+    typ: str
+    amt: float
+    cost: float
+    site: str
+    ts_parsed: datetime
+
+class Sell(NamedTuple):
+    typ: str
+    amt: float
+    cost: float
+    site: str
+    ts_parsed: datetime
+
+class CostBasis(NamedTuple):
+    typ: str
+    amt: float
+    proceeds: float
+    basis: float
+    buy_ts: datetime
+    sell_ts: datetime
+    buy_site: str
+    sell_site: str
+
+Buys = List[Buy]
+Sells = List[Sell]
+BuyOrSellType = Union[Type[Buy], Type[Sell]]
 
 def cost_basis(buys_sells):
     # type: (List[Union[Buy, Sell]]) -> Tuple[List[CostBasis], List[Buy]]
@@ -143,7 +193,7 @@ def get_buys_sells_by_typ(common_rows_w_usd):
                 buys.append(Buy(dst_typ, row.dst, row.dst_usd, row.site, row.ts_parsed))
                 sells.append(Sell(src_typ, -row.src, -row.src_usd, row.site, row.ts_parsed))
 
-    bs_by_typ = defaultdict(list)
+    bs_by_typ = defaultdict(list)  # type: Dict[str, List[Union[Buy, Sell]]]
     for buy in buys:
         bs_by_typ[buy.typ].append(buy)
     for sell in sells:
@@ -206,7 +256,7 @@ class GdaxPriceCache(object):
         return self.gdax_price_cache[(typ, isots)]
 
 def fetch_usd_equivalents(common_rows):
-    # type: List[CommonRow] -> List[CommonRowWUSD]
+    # type: (List[CommonRow]) -> List[CommonRowWUSD]
     with GdaxPriceCache.deco() as gdax_price_cache:
         common_rows_w_usd = []
         for row in common_rows:
@@ -236,11 +286,11 @@ def fetch_usd_equivalents(common_rows):
         return common_rows_w_usd
 
 def dedupe_bs(buys_sells):
-    # type: List[Union[Buys, Sells]] -> List[Union[Buys, Sells]]
+    # type: (List[Union[Buy, Sell]]) -> List[Union[Buy, Sell]]
     """Dedupe things that happened on the same day"""
-    by_day = defaultdict(list)
+    by_day = defaultdict(list)  # type: Dict[Tuple[BuyOrSellType, str, str, datetime], List[Union[Buy, Sell]]]
     for row in buys_sells:
-        by_day[(type(row), row.typ, row.site, row.ts_parsed.date())].append(row)
+        by_day[(type(row), row.typ, row.site, datetime.combine(row.ts_parsed.date(), dt_time.min))].append(row)
 
     deduped_rows = []
     for (buy_or_sell, typ, site, ts_date), rows in by_day.items():
@@ -272,11 +322,15 @@ def dedupe_bs(buys_sells):
     return deduped_rows
 
 def dedupe_cb(cost_basis):
-    # type: List[CostBasis] -> List[CostBasis]
+    # type: (List[CostBasis]) -> List[CostBasis]
     """Dedupe things that happened on the same day"""
-    by_day = defaultdict(list)
+    by_day = defaultdict(list)  # type: Dict[Tuple[str, datetime, datetime], List[CostBasis]]
     for row in cost_basis:
-        by_day[(row.typ, row.buy_ts.date(), row.sell_ts.date())].append(row)
+        by_day[(
+            row.typ,
+            datetime.combine(row.buy_ts.date(), dt_time.min),
+            datetime.combine(row.sell_ts.date(), dt_time.min)
+        )].append(row)
 
     deduped_rows = []
     for (typ, buy_ts, sell_ts), rows in by_day.items():
@@ -301,7 +355,7 @@ def dedupe_cb(cost_basis):
     return deduped_rows
 
 def convert_cex_row(row):
-    # type: (Dict[str, str]) -> CommonRow
+    # type: (Dict[str, str]) -> Optional[CommonRow]
     if row['Type'] in ('deposit', 'withdraw'):
         # Just a transfer.
         return None
@@ -310,18 +364,18 @@ def convert_cex_row(row):
         return None
     elif row['Type'] == 'sell' and row['Pair'] in ('ETH/USD', 'ETH/EUR'):
         comment = re.match("Sold (.*) ETH at (.*) (USD|EUR)", row['Comment'])
-        eth, price = comment.group(1, 2)
-        eth = -float(eth)
-        price = float(price)
+        assert comment is not None
+        eth = -float(comment.group(1))
+        price = float(comment.group(2))
         fiat = float(row['Amount'])
         assert abs(price * eth + float(row['FeeAmount']) + fiat) <= .01
         return CommonRow(row['Pair'], eth, fiat, 'CEX', row['DateUTC'],
                          dateparse(row['DateUTC']).replace(tzinfo=tzutc()))
     elif row['Type'] == 'buy' and row['Pair'] in ('ETH/USD', 'ETH/EUR'):
         comment = re.match("Bought (.*) ETH at (.*) USD", row['Comment'])
-        eth, price = comment.group(1, 2)
-        eth = float(eth)
-        price = float(price)
+        assert comment is not None
+        eth = float(comment.group(1))
+        price = float(comment.group(2))
         assert eth == float(row['Amount'])
         fiat = -(price * eth)
         return CommonRow(row['Pair'], eth, fiat, 'CEX', row['DateUTC'],
@@ -344,7 +398,7 @@ def test_convert_cex_row():
     ]
 
 def convert_coinbase_row(row):
-    # type: (Dict[str, str]) -> CommonRow
+    # type: (Dict[str, str]) -> Optional[CommonRow]
     crypto_type = row['Currency']
     fiat_type = row['Transfer Total Currency']
     if not (crypto_type and fiat_type):
@@ -374,9 +428,9 @@ def test_convert_coinbase_row():
                   datetime(2017, 7, 11, 17, 4, 58, tzinfo=tzoffset(None, -25200))),
     ]
 
-kraken_cache = {}  # type: Dict[str, Tuple[str, str]]
+kraken_cache = {}  # type: Dict[str, Dict[str, str]]
 def convert_kraken_row(row):
-    # type: (Dict[str, str]) -> CommonRow
+    # type: (Dict[str, str]) -> Optional[CommonRow]
     if row['type'] in ('deposit', 'withdrawal', 'transfer'):
         return None
     if row['type'] != 'trade':
@@ -452,7 +506,7 @@ def test_convert_poloniex_row():
     ]
 def convert_gdax_rows(rows):
     # type: (List[Dict[str, str]]) -> List[CommonRow]
-    gdax_trades = defaultdict(list)
+    gdax_trades = defaultdict(list)  # type: Dict[str, List[Dict[str, str]]]
     for row in rows:
         if row['trade id']:
             gdax_trades[row['trade id']].append(row)
@@ -471,7 +525,7 @@ def convert_gdax_rows(rows):
 
         # Two matches, and one fee
         assert len(trade) == 3
-        unit_to_amount = defaultdict(float)
+        unit_to_amount = defaultdict(float)  # type: Dict[str, float]
         for trade_item in trade:
             assert trade_item['type'] in ('match', 'fee')
             unit_to_amount[trade_item['amount/balance unit']] += float(trade_item['amount'])
@@ -494,7 +548,7 @@ def convert_rows(rows, convert_func):
     assert not kraken_cache
     return common_rows
 
-def run_2016_2017():
+def import_2016_2017():
     with open('csvs/123117-CEX.csv') as f:
         cex_rows = list(csv.DictReader(f))
 
@@ -557,6 +611,10 @@ def run_2016_2017():
         common_kraken_rows + common_poloniex_rows + common_gdax_rows + common_extra_rows,
         key=lambda row: row.ts_parsed,
     )
+    return common_rows
+
+def run_2016_2017():
+    common_rows = import_2016_2017()
 
     print("Total common rows:")
     pprint(len(common_rows))
@@ -659,7 +717,7 @@ def run_2016_2017():
 
     pprint(totals)
 
-    import IPython; IPython.embed()
+    # import IPython; IPython.embed()
 
 if __name__ == "__main__":
     run_2016_2017()

@@ -706,7 +706,7 @@ def import_2018():
         cb_eth_rows = list(csv.DictReader(f))
 
     print("Orig row Counts")
-    pprint([len(rows_2017), len(cex_rows)])
+    pprint([len(rows_2017), len(cex_rows), len(gdax_rows), len(cb_eth_rows)])
 
     common_rows_2017 = convert_rows(rows_2017, convert_remaining_asset)
     common_cex_rows = convert_rows(cex_rows, convert_cex_row)
@@ -718,8 +718,8 @@ def import_2018():
         key=lambda row: row.ts_parsed)
     return common_rows
 
-def make_intermediate(common_rows):
-    # type: (List[CommonRow]) -> Dict[str, List[CostBasis]]
+def make_intermediate(common_rows, year):
+    # type: (List[CommonRow], int) -> Dict[str, List[CostBasis]]
 
     print("Total common rows:")
     pprint(len(common_rows))
@@ -728,14 +728,14 @@ def make_intermediate(common_rows):
         shutil.rmtree('intermediate')
     os.mkdir('intermediate')
 
-    with open('intermediate/01-123117-rows_interleaved.csv', 'w') as f:
+    with open('intermediate/01-%s-rows_interleaved.csv' % year, 'w') as f:
         w = csv.writer(f)
         w.writerow(CommonRow._fields)
         w.writerows(common_rows)
 
     common_rows_w_usd = fetch_usd_equivalents(common_rows)
 
-    with open('intermediate/02-123117-rows_interleaved_w_usd.csv', 'w') as f:
+    with open('intermediate/02-%s-rows_interleaved_w_usd.csv' % year, 'w') as f:
         w = csv.writer(f)
         w.writerow(CommonRowWUSD._fields)
         w.writerows(common_rows_w_usd)
@@ -744,7 +744,7 @@ def make_intermediate(common_rows):
 
     # Dedupe buys_sells to write to file for observation
     deduped_bs_by_typ = {typ: dedupe_bs(buys_sells) for typ, buys_sells in bs_by_typ.items()}
-    with open('intermediate/03-123117-rows_deduped_by_day.csv', 'w') as f:
+    with open('intermediate/03-%s-rows_deduped_by_day.csv' % year, 'w') as f:
         w = csv.writer(f)
         w.writerow(['BuyOrSell'] + list(Buy._fields))
         for typ, bses in deduped_bs_by_typ.items():
@@ -753,13 +753,13 @@ def make_intermediate(common_rows):
     # FINALLY. Get cost basis and remaining assets.
     cb_by_typ = {typ: cost_basis(buys_sells) for typ, buys_sells in bs_by_typ.items()}
 
-    with open('intermediate/04-123117-cost_basis.csv', 'w') as f:
+    with open('intermediate/04-%s-cost_basis.csv' % year, 'w') as f:
         w = csv.writer(f)
         w.writerow(CostBasis._fields)
         for typ, (cbs, assets) in cb_by_typ.items():
             w.writerows(cbs)
 
-    with open('intermediate/05-123117-remaining_assets.csv', 'w') as f:
+    with open('intermediate/05-%s-remaining_assets.csv' % year, 'w') as f:
         w = csv.writer(f)
         w.writerow(Buy._fields)
         for typ, (cbs, assets) in cb_by_typ.items():
@@ -769,14 +769,18 @@ def make_intermediate(common_rows):
     deduped_cb_by_typ = {typ: dedupe_cb(cost_basis) for typ, (cost_basis, leftover) in cb_by_typ.items()}
     pprint(deduped_cb_by_typ)
 
-    with open('intermediate/06-123117-cb_deduped_by_day.csv', 'w') as f:
+    with open('intermediate/06-%s-cb_deduped_by_day.csv' % year, 'w') as f:
         w = csv.writer(f)
         w.writerow(list(CostBasis._fields))
         for typ, cbs in deduped_cb_by_typ.items():
             w.writerows(cbs)
 
-    for yr in (2016, 2017, 2018):
-        with open('intermediate/07-%d-cb_for_easytxf.csv' % yr, 'w') as f:
+    yrs = [year]
+    if year == 2017:
+        yrs.append(2016)  # Special case the first year I ran this
+
+    for yr in yrs:
+        with open('intermediate/07-%d-cb_for_8949.csv' % yr, 'w') as f:
             w = csv.writer(f)
             w.writerow(["Symbol", "Quantity", "Date Acquired", "Date Sold", "Proceeds",
                         "Cost Basis", "Gain (or loss)", "Sale Category"])
@@ -797,13 +801,14 @@ def make_intermediate(common_rows):
 
     return deduped_cb_by_typ
 
-def printout(deduped_cb_by_typ):
-    # type: (Dict[str, List[CostBasis]]) -> None
-    totals = {
-        2016: {},
-        2017: {},
-    }  # type: Dict[int, Dict[str, float]]
-    for yr in (2016, 2017):
+def printout(deduped_cb_by_typ, year):
+    # type: (Dict[str, List[CostBasis]], int) -> None
+    yrs = [year]
+    if year == 2017:
+        yrs.append(2016)  # Special case the first year I ran this
+
+    totals = {yr: {} for yr in yrs}  # type: Dict[int, Dict[str, float]]
+    for yr in yrs:
         totals[yr]['st_proceeds'] = sum(
             r.proceeds for cbs in deduped_cb_by_typ.values() for r in cbs
             if r.sell_ts - r.buy_ts < timedelta(days=366) and r.sell_ts.year == yr
@@ -828,14 +833,16 @@ def printout(deduped_cb_by_typ):
 def run_2016_2017():
     # type: () -> None
     common_rows = import_2016_2017()
-    deduped_cb_by_typ = make_intermediate(common_rows)
-    printout(deduped_cb_by_typ)
+    deduped_cb_by_typ = make_intermediate(common_rows, 2017)
+    printout(deduped_cb_by_typ, 2017)
 
     # import IPython; IPython.embed()
 
 def run_2018():
     # type: () -> None
     common_rows = import_2018()
+    deduped_cb_by_typ = make_intermediate(common_rows, 2018)
+    printout(deduped_cb_by_typ, 2018)
     import IPython; IPython.embed()
 
 if __name__ == "__main__":

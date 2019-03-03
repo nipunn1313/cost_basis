@@ -552,6 +552,70 @@ def convert_gdax_rows(rows):
 
     return common_rows
 
+def convert_remaining_asset(row):
+    # type: (Mapping[str, str]) -> Optional[CommonRow]
+    return CommonRow(
+        row["typ"] + "/USD",
+        float(row["amt"]),
+        -float(row["cost"]),
+        row["site"] + " from prev year",
+        row["ts_parsed"],
+        dateparse(row["ts_parsed"]).replace(tzinfo=tzutc()),
+    )
+
+def test_convert_remaining_assets():
+    # type: () -> None
+    t = """typ,amt,cost,site,ts_parsed
+BTC,0.005428050000000005,2.3028089513449137,Coinbase,2016-04-03 12:44:17-07:00
+BTC,0.0035720800000009767,1.538369914147097,Coinbase,2016-04-11 23:31:12-07:00
+"""
+    f = StringIO(t)
+    remaining_assets = list(csv.DictReader(f))
+    common_rows = convert_rows(remaining_assets, convert_remaining_asset)
+    assert common_rows == [
+        CommonRow("BTC/USD", 0.005428050000000005, -2.3028089513449137, "Coinbase from prev year", "2016-04-03 12:44:17-07:00",
+                  datetime(2016, 4, 3, 12, 44, 17, tzinfo=tzutc())),
+        CommonRow("BTC/USD", 0.0035720800000009767, -1.538369914147097, "Coinbase from prev year", "2016-04-11 23:31:12-07:00",
+                  datetime(2016, 4, 11, 23, 31, 12, tzinfo=tzutc())),
+    ]
+
+def convert_gdax_2018_row(row):
+    # type: (Mapping[str, str]) -> Optional[CommonRow]
+    src, dst = row["product"].split("-")
+    assert src == row["size unit"]
+    assert dst == row["price/fee/total unit"]
+    amt = float(row["size"])
+    cost = float(row["total"])
+    assert row["side"] in ("SELL", "BUY")
+    if row["side"] == "SELL":
+        amt = -amt
+    else:
+        cost = -(cost + float(row["fee"]))
+    return CommonRow(
+        src + "/" + dst,
+        amt,
+        cost,
+        "GDAX",
+        row["created at"],
+        dateparse(row["created at"]).replace(microsecond=0),
+    )
+
+def test_convert_gdax_2018_row():
+    # type: () -> None
+    t = """trade id,product,side,created at,size,size unit,price,fee,total,price/fee/total unit
+24029435,ETH-USD,SELL,2018-01-02T16:52:03.018Z,0.47044898,ETH,872.79,1.2318094957626,409.3713557584374,USD
+24029436,ETH-USD,SELL,2018-01-02T16:52:03.018Z,0.01834062,ETH,872.79,0.0480225291894,15.9594872006106,USD
+"""
+    f = StringIO(t)
+    gdax_rows = list(csv.DictReader(f))
+    common_rows = convert_rows(gdax_rows, convert_gdax_2018_row)
+    assert common_rows == [
+        CommonRow("ETH/USD", -0.47044898, 409.3713557584374, "GDAX", "2018-01-02T16:52:03.018Z",
+                  datetime(2018, 1, 2, 16, 52, 3, tzinfo=tzutc())),
+        CommonRow("ETH/USD", -0.01834062, 15.9594872006106, "GDAX", "2018-01-02T16:52:03.018Z",
+                  datetime(2018, 1, 2, 16, 52, 3, tzinfo=tzutc())),
+    ]
+
 def convert_rows(rows, convert_func):
     # type: (Sequence[Mapping[str, str]], Callable[[Mapping[str, str]], Optional[CommonRow]]) -> List[CommonRow]
     common_rows = []
@@ -630,7 +694,29 @@ def import_2016_2017():
 
 def import_2018():
     # type: () -> List[CommonRow]
-    raise NotImplementedError()
+    with open('csvs/05-123117-remaining_assets.csv') as f:
+        rows_2017 = list(csv.DictReader(f))
+    with open('csvs/CEX_IO_transactions.csv') as f:
+        cex_rows = list(csv.DictReader(f))
+    with open('csvs/GDAX_fills.csv') as f:
+        gdax_rows = list(csv.DictReader(f))
+    with open('csvs/Coinbase-ETH-TransactionsReport-2019-02-24-21_04_19.csv') as f:
+        for _ in range(4):
+            f.readline()
+        cb_eth_rows = list(csv.DictReader(f))
+
+    print("Orig row Counts")
+    pprint([len(rows_2017), len(cex_rows)])
+
+    common_rows_2017 = convert_rows(rows_2017, convert_remaining_asset)
+    common_cex_rows = convert_rows(cex_rows, convert_cex_row)
+    common_gdax_rows = convert_rows(gdax_rows, convert_gdax_2018_row)
+    common_cb_eth_rows = convert_rows(cb_eth_rows, convert_coinbase_row)
+
+    common_rows = sorted(
+        common_rows_2017 + common_cex_rows + common_gdax_rows + common_cb_eth_rows,
+        key=lambda row: row.ts_parsed)
+    return common_rows
 
 def make_intermediate(common_rows):
     # type: (List[CommonRow]) -> Dict[str, List[CostBasis]]
@@ -753,4 +839,4 @@ def run_2018():
     import IPython; IPython.embed()
 
 if __name__ == "__main__":
-    run_2016_2017()
+    run_2018()

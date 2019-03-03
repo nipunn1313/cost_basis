@@ -2,3 +2,6 @@
 csvs/
 intermediate/
 gdax_price_cache/
+.mypy_cache
+__pycache__
+.pytest_cache

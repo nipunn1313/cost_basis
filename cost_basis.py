@@ -24,6 +24,7 @@ from pprint import pprint
 from typing import (
     Callable,
     Dict,
+    Iterator,
     List,
     Mapping,
     NamedTuple,
@@ -136,6 +137,7 @@ def select_buy(sell, buys):
     assert buys == sorted(buys, key=lambda r: r.ts_parsed)
 
     def smart_lifo():
+        # type: () -> int
         # If it's ST no matter what, take the shortest
         if sell.ts_parsed - buys[0].ts_parsed < timedelta(days=366):
             return len(buys) - 1
@@ -147,6 +149,7 @@ def select_buy(sell, buys):
         raise Exception("Something went wrong")
 
     def lowest_gains():
+        # type: () -> int
         # This optimizes for paying least taxes now. Most open positions left for later.
         # If it's ST no matter what, take the smallest gain
         if sell.ts_parsed - buys[0].ts_parsed < timedelta(days=366):
@@ -207,11 +210,13 @@ def get_buys_sells_by_typ(common_rows_w_usd):
 
 class GdaxPriceCache(object):
     def __init__(self):
-        self.gdax_price_cache = {}
+        # type: () -> None
+        self.gdax_price_cache = {}  # type: Dict[Tuple[str, str], Optional[float]]
 
     @staticmethod
     @contextmanager
     def deco():
+        # type: () -> Iterator[GdaxPriceCache]
         gpc = GdaxPriceCache()
         with open('gdax_price_cache/gdax_price_cache.csv') as f:
             for row in csv.DictReader(f):
@@ -227,6 +232,7 @@ class GdaxPriceCache(object):
                 w.writerow([typ, isots, result])
 
     def get(self, typ, ts_parsed):
+        # type: (str, datetime) -> Optional[float]
         isots = ts_parsed.isoformat()
         isots_end = (ts_parsed + timedelta(seconds=65)).isoformat()
 
@@ -241,7 +247,7 @@ class GdaxPriceCache(object):
 
         if (typ, isots) not in self.gdax_price_cache:
             req = "{}/products/{}-USD/candles".format(GDAX_API, typ)
-            params = {'granularity': 60, 'start': isots, 'end': isots_end}
+            params = {'granularity': "60", 'start': str(isots), 'end': str(isots_end)}
             result = requests.get(req, params).json()
             print("Req = {}. Params = {}\nResult = {}".format(req, params, result))
             if not result:
@@ -278,8 +284,10 @@ def fetch_usd_equivalents(common_rows):
                 assert src_usd or dst_usd
                 # If only one of the two rates were available, assume the trade was at
                 # fair market value and src/dst amounts were worth the same in USD
-                src_usd = src_usd or -dst_usd
-                dst_usd = dst_usd or -src_usd
+                if src_usd is not None:
+                    dst_usd = dst_usd or -src_usd
+                if dst_usd is not None:
+                    src_usd = src_usd or -dst_usd
 
             common_rows_w_usd.append(CommonRowWUSD(
                 row.pair, row.src, row.dst, row.site, row.ts_parsed, src_usd, dst_usd,
@@ -386,6 +394,7 @@ def convert_cex_row(row):
         raise Exception("Unknown CEX row: %s" % row)
 
 def test_convert_cex_row():
+    # type: () -> None
     t = """DateUTC,Amount,Symbol,Balance,Type,Pair,FeeSymbol,FeeAmount,Comment
 2017-12-20 09:55:03,795.59,USD,895.75,sell,ETH/USD,USD,1.98,Sold 0.88816258 ETH at 898 USD
 2017-12-31 19:23:29,1.11126500,ETH,1.11126500,buy,ETH/USD,USD,2.29,Bought 1.11126500 ETH at 821.9999 USD"""
@@ -416,6 +425,7 @@ def convert_coinbase_row(row):
     return CommonRow(pair, crypto, fiat, 'Coinbase', row['Timestamp'], dateparse(row['Timestamp']))
 
 def test_convert_coinbase_row():
+    # type: () -> None
     t = """Timestamp,Balance,Amount,Currency,To,Notes,Instantly Exchanged,Transfer Total,Transfer Total Currency,Transfer Fee,Transfer Fee Currency,Transfer Payment Method,Transfer ID,Order Price,Order Currency,Order BTC,Order Tracking Code,Order Custom Parameter,Order Paid Out,Recurring Payment ID,Coinbase ID (visit https://www.coinbase.com/transactions/[ID] in your browser),Bitcoin Hash (visit https://www.coinbase.com/tx/[HASH] in your browser for more info)
 2016-04-03 12:44:17 -0700,0.04714286,0.04714286,BTC,570170d6ede0d822170003cb,Bought 0.04714286 BTC for $20.00 USD.,false,20.0,USD,0.2,USD,Bank of America - BofA... ********9496,5701728b2ee3cd04b500048b,"","","","","","","",57017291e42ae13d2a00020b,""
 2017-07-11 17:04:58 -0700,8.28632484,-1.0,ETH,572a417ae1764802e1000599,596567a9ea216a0222536a1d,false,187.53,USD,2.99,USD,USD Wallet,596567a9ea216a0222536a1d,"","","","","","","",596567aa2122dd0001f25f0d,""
@@ -461,6 +471,7 @@ def convert_kraken_row(row):
     return CommonRow(pair, prev_amt, amt, 'Kraken', row['time'], dateparse(row['time']).replace(tzinfo=tzutc()))
 
 def test_convert_kraken_row():
+    # type: () -> None
     t = """"txid","refid","time","type","aclass","asset","amount","fee","balance"
 "LQT3EO-D4PO7-6QCRZP","TZBXCO-6DHLN-ZO22HQ","2016-04-23 21:23:03","trade","currency","XETH",-2.0000000000,0.0000000000,8.0000000000
 "LRY4II-TYZCS-QLC4FT","TZBXCO-6DHLN-ZO22HQ","2016-04-23 21:23:03","trade","currency","ZUSD",16.9710,0.0441,16.9269
@@ -493,6 +504,7 @@ def convert_poloniex_row(row):
     return CommonRow(row['Market'], src, dst, 'Poloniex', row['Date'], dateparse(row['Date']).replace(tzinfo=tzutc()))
 
 def test_convert_poloniex_row():
+    # type: () -> None
     t = """Date,Market,Category,Type,Price,Amount,Total,Fee,Order Number,Base Total Less Fee,Quote Total Less Fee
 2016-06-29 03:54:56,XEM/BTC,Exchange,Buy,0.00001934,27774.58651931,0.53716050,0.15%,2311153645,-0.53716050,27732.92463954
 2017-12-16 23:41:09,XEM/BTC,Exchange,Sell,0.00003310,6429.67600000,0.21282227,0.25%,38237473363,0.21229022,-6429.67600000
@@ -616,6 +628,10 @@ def import_2016_2017():
     )
     return common_rows
 
+def import_2018():
+    # type: () -> List[CommonRow]
+    raise NotImplementedError()
+
 def make_intermediate(common_rows):
     # type: (List[CommonRow]) -> Dict[str, List[CostBasis]]
 
@@ -724,11 +740,17 @@ def printout(deduped_cb_by_typ):
     pprint(totals)
 
 def run_2016_2017():
+    # type: () -> None
     common_rows = import_2016_2017()
     deduped_cb_by_typ = make_intermediate(common_rows)
     printout(deduped_cb_by_typ)
 
     # import IPython; IPython.embed()
+
+def run_2018():
+    # type: () -> None
+    common_rows = import_2018()
+    import IPython; IPython.embed()
 
 if __name__ == "__main__":
     run_2016_2017()
